@@ -119,7 +119,7 @@ mod tests {
             .set_tp(FieldTypeTp::String)
             .set_flen(flen);
         c.set_field_type(field_tp);
-        let e = Expression::build(&ctx, c).unwrap();
+        let e = Expression::build(&mut ctx, c).unwrap();
         // test without pad_char_to_full_length
         let s = "你好".as_bytes().to_owned();
         let row = vec![Datum::Bytes(s.clone())];
@@ -142,7 +142,7 @@ mod tests {
             Datum::I64(-30),
             Datum::U64(u64::MAX),
             Datum::F64(124.32),
-            Datum::Dec(dec.clone()),
+            Datum::Dec(dec),
             Datum::Bytes(s.clone()),
             Datum::Dur(dur),
         ];
@@ -152,7 +152,7 @@ mod tests {
             EvalResults(Some(-30), None, None, None, None, None, None),
             EvalResults(Some(-1), None, None, None, None, None, None),
             EvalResults(None, Some(124.32), None, None, None, None, None),
-            EvalResults(None, None, Some(dec.clone()), None, None, None, None),
+            EvalResults(None, None, Some(dec), None, None, None, None),
             EvalResults(None, None, None, Some(s.clone()), None, None, None),
             EvalResults(None, None, None, None, None, Some(dur), None),
         ];
@@ -160,7 +160,7 @@ mod tests {
         let mut ctx = EvalContext::default();
         for (ii, exp) in expecteds.iter().enumerate().take(row.len()) {
             let c = col_expr(ii as i64);
-            let e = Expression::build(&ctx, c).unwrap();
+            let e = Expression::build(&mut ctx, c).unwrap();
 
             let i = e.eval_int(&mut ctx, &row).unwrap_or(None);
             let r = e.eval_real(&mut ctx, &row).unwrap_or(None);
@@ -202,7 +202,7 @@ mod tests {
             let mut field_tp = FieldType::default();
             field_tp.as_mut_accessor().set_tp(tp);
             c.set_field_type(field_tp);
-            let e = Expression::build(&ctx, c).unwrap();
+            let e = Expression::build(&mut ctx, c).unwrap();
             let res = e.eval_string(&mut ctx, &row).unwrap().unwrap();
             assert_eq!(res.as_ref(), b"12");
         }
@@ -212,7 +212,7 @@ mod tests {
             let mut field_tp = FieldType::default();
             field_tp.as_mut_accessor().set_tp(tp);
             c.set_field_type(field_tp);
-            let e = Expression::build(&ctx, c).unwrap();
+            let e = Expression::build(&mut ctx, c).unwrap();
             let res = e.eval_string(&mut ctx, &row);
             assert!(res.is_err());
         }

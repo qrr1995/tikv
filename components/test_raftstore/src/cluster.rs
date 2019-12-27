@@ -1,6 +1,6 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::path::Path;
+use std::error::Error as StdError;
 use std::sync::{self, mpsc, Arc, RwLock};
 use std::time::*;
 use std::{result, thread};
@@ -18,12 +18,14 @@ use engine::rocks::DB;
 use engine::Engines;
 use engine::Peekable;
 use engine::CF_DEFAULT;
+use engine_rocks::RocksEngine;
 use pd_client::PdClient;
 use tikv::config::TiKvConfig;
 use tikv::raftstore::store::fsm::{create_raft_batch_system, PeerFsm, RaftBatchSystem, RaftRouter};
 use tikv::raftstore::store::*;
 use tikv::raftstore::{Error, Result};
 use tikv::server::Result as ServerResult;
+use tikv::storage::config::DEFAULT_ROCKSDB_SUB_DIR;
 use tikv_util::collections::{HashMap, HashSet};
 use tikv_util::HandyRwLock;
 
@@ -54,7 +56,7 @@ pub trait Simulator {
         &self,
         node_id: u64,
         request: RaftCmdRequest,
-        cb: Callback,
+        cb: Callback<RocksEngine>,
     ) -> Result<()>;
     fn send_raft_msg(&mut self, msg: RaftMessage) -> Result<()>;
     fn get_snap_dir(&self, node_id: u64) -> String;
@@ -127,10 +129,18 @@ impl<T: Simulator> Cluster<T> {
         self.cfg.server.cluster_id
     }
 
+    pub fn pre_start_check(&mut self) -> result::Result<(), Box<dyn StdError>> {
+        for path in &self.paths {
+            self.cfg.storage.data_dir = path.path().to_str().unwrap().to_owned();
+            self.cfg.validate()?
+        }
+        Ok(())
+    }
+
     pub fn create_engines(&mut self) {
         for _ in 0..self.count {
             let dir = Builder::new().prefix("test_cluster").tempdir().unwrap();
-            let kv_path = dir.path().join("kv");
+            let kv_path = dir.path().join(DEFAULT_ROCKSDB_SUB_DIR);
             let cache = self.cfg.storage.block_cache.build_shared_cache();
             let kv_db_opt = self.cfg.rocksdb.build_opt();
             let kv_cfs_opt = self.cfg.rocksdb.build_cf_opts(&cache);
@@ -138,7 +148,7 @@ impl<T: Simulator> Cluster<T> {
                 rocks::util::new_engine_opt(kv_path.to_str().unwrap(), kv_db_opt, kv_cfs_opt)
                     .unwrap(),
             );
-            let raft_path = dir.path().join(Path::new("raft"));
+            let raft_path = dir.path().join("raft");
             let raft_engine = Arc::new(
                 rocks::util::new_engine(raft_path.to_str().unwrap(), None, &[CF_DEFAULT], None)
                     .unwrap(),
@@ -369,7 +379,7 @@ impl<T: Simulator> Cluster<T> {
                 };
                 leaders
                     .entry(l.get_id())
-                    .or_insert_with(|| (l, vec![]))
+                    .or_insert((l, vec![]))
                     .1
                     .push(*store_id);
             }
@@ -832,7 +842,12 @@ impl<T: Simulator> Cluster<T> {
     // It's similar to `ask_split`, the difference is the msg, it sends, is `Msg::SplitRegion`,
     // and `region` will not be embedded to that msg.
     // Caller must ensure that the `split_key` is in the `region`.
-    pub fn split_region(&mut self, region: &metapb::Region, split_key: &[u8], cb: Callback) {
+    pub fn split_region(
+        &mut self,
+        region: &metapb::Region,
+        split_key: &[u8],
+        cb: Callback<RocksEngine>,
+    ) {
         let leader = self.leader_of_region(region.get_id()).unwrap();
         let router = self.sim.rl().get_router(leader.get_store_id()).unwrap();
         let split_key = split_key.to_vec();
