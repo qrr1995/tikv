@@ -13,18 +13,24 @@ use kvproto::raft_cmdpb::*;
 use kvproto::raft_serverpb;
 use tempfile::{Builder, TempDir};
 
+use super::*;
 use engine::Engines;
 use engine_rocks::RocksEngine;
-use tikv::config::{ConfigController, TiKvConfig};
+use tikv::config::{ConfigController, ConfigHandler, Module, TiKvConfig};
 use tikv::coprocessor;
 use tikv::import::{ImportSSTService, SSTImporter};
+use tikv::raftstore::coprocessor::config::SplitCheckConfigManager;
 use tikv::raftstore::coprocessor::{CoprocessorHost, RegionInfoAccessor};
 use tikv::raftstore::router::{RaftStoreBlackHole, RaftStoreRouter, ServerRaftStoreRouter};
+use tikv::raftstore::store::config::RaftstoreConfigManager;
+use tikv::raftstore::store::fsm::store::{StoreMeta, PENDING_VOTES_CAP};
 use tikv::raftstore::store::fsm::{RaftBatchSystem, RaftRouter};
+use tikv::raftstore::store::SplitCheckRunner;
 use tikv::raftstore::store::{Callback, LocalReader, SnapManager};
 use tikv::raftstore::Result;
+use tikv::server::gc_worker::GcWorker;
 use tikv::server::load_statistics::ThreadLoad;
-use tikv::server::lock_manager::{Config as PessimisticTxnConfig, LockManager};
+use tikv::server::lock_manager::LockManager;
 use tikv::server::resolve::{self, Task as ResolveTask};
 use tikv::server::service::DebugService;
 use tikv::server::Result as ServerResult;
@@ -32,15 +38,11 @@ use tikv::server::{
     create_raft_storage, Config, Error, Node, PdStoreAddrResolver, RaftClient, RaftKv, Server,
     ServerTransport,
 };
-
 use tikv::storage;
 use tikv_util::collections::{HashMap, HashSet};
+use tikv_util::config::VersionTrack;
 use tikv_util::security::SecurityManager;
 use tikv_util::worker::{FutureWorker, Worker};
-
-use super::*;
-use tikv::raftstore::store::fsm::store::{StoreMeta, PENDING_VOTES_CAP};
-use tikv::server::gc_worker::GcWorker;
 
 type SimulateStoreTransport = SimulateTransport<ServerRaftStoreRouter>;
 type SimulateServerTransport =
@@ -135,6 +137,12 @@ impl Simulator for ServerCluster {
 
         let raft_engine = RaftKv::new(sim_router.clone());
 
+        // Create coprocessor.
+        let mut coprocessor_host = CoprocessorHost::new(router.clone());
+
+        let region_info_accessor = RegionInfoAccessor::new(&mut coprocessor_host);
+        region_info_accessor.start();
+
         // Create storage.
         let pd_worker = FutureWorker::new("test-pd-worker");
         let storage_read_pool = storage::build_read_pool_for_test(
@@ -144,14 +152,20 @@ impl Simulator for ServerCluster {
 
         let engine = RaftKv::new(sim_router.clone());
 
-        let mut gc_worker = GcWorker::new(engine.clone(), None, None, cfg.gc.clone());
+        let mut gc_worker = GcWorker::new(
+            engine.clone(),
+            Some(engines.kv.clone()),
+            Some(raft_router.clone()),
+            Some(region_info_accessor.clone()),
+            cfg.gc.clone(),
+        );
         gc_worker.start().unwrap();
 
         let mut lock_mgr = LockManager::new();
         let store = create_raft_storage(
             engine,
             &cfg.storage,
-            storage_read_pool,
+            storage_read_pool.into(),
             Some(lock_mgr.clone()),
         )?;
         self.storages.insert(node_id, raft_engine);
@@ -172,11 +186,13 @@ impl Simulator for ServerCluster {
             .name_prefix(thd_name!("debugger"))
             .pool_size(1)
             .create();
+
         let debug_service = DebugService::new(
             engines.clone(),
             pool,
-            raft_router.clone(),
-            gc_worker.clone(),
+            raft_router,
+            gc_worker.get_config_manager(),
+            false,
         );
 
         // Create deadlock service.
@@ -191,7 +207,7 @@ impl Simulator for ServerCluster {
             &tikv::config::CoprReadPoolConfig::default_for_test(),
             store.get_engine(),
         );
-        let cop = coprocessor::Endpoint::new(&server_cfg, cop_read_pool);
+        let cop = coprocessor::Endpoint::new(&server_cfg, cop_read_pool.into());
         let mut server = None;
         for _ in 0..100 {
             let mut svr = Server::new(
@@ -203,6 +219,7 @@ impl Simulator for ServerCluster {
                 resolver.clone(),
                 snap_mgr.clone(),
                 gc_worker.clone(),
+                None,
             )
             .unwrap();
             svr.register_service(create_import_sst(import_service.clone()));
@@ -226,36 +243,62 @@ impl Simulator for ServerCluster {
         let addr = server.listening_addr();
         cfg.server.addr = format!("{}", addr);
         let trans = server.transport();
-        let simulate_trans = SimulateTransport::new(trans.clone());
+        let simulate_trans = SimulateTransport::new(trans);
         let server_cfg = Arc::new(cfg.server.clone());
 
         // Create node.
+        let mut raft_store = cfg.raft_store.clone();
+        raft_store.validate().unwrap();
         let mut node = Node::new(
             system,
             &cfg.server,
-            &cfg.raft_store,
+            Arc::new(VersionTrack::new(raft_store)),
             Arc::clone(&self.pd_client),
         );
-
-        // Create coprocessor.
-        let mut coprocessor_host = CoprocessorHost::new(cfg.coprocessor.clone(), router.clone());
-
-        let region_info_accessor = RegionInfoAccessor::new(&mut coprocessor_host);
-        region_info_accessor.start();
 
         // Register the role change observer of the lock manager.
         lock_mgr.register_detector_role_change_observer(&mut coprocessor_host);
 
-        let cfg_controller = ConfigController::new(cfg);
+        let pessimistic_txn_cfg = cfg.pessimistic_txn.clone();
+        let mut cfg_controller = ConfigController::new(cfg.clone(), Default::default());
+
+        let mut split_check_worker = Worker::new("split-check");
+        let split_check_runner = SplitCheckRunner::new(
+            Arc::clone(&engines.kv),
+            router.clone(),
+            coprocessor_host.clone(),
+            cfg.coprocessor.clone(),
+        );
+        split_check_worker.start(split_check_runner).unwrap();
+        cfg_controller.register(
+            Module::Coprocessor,
+            Box::new(SplitCheckConfigManager(split_check_worker.scheduler())),
+        );
+
+        let mut raftstore_cfg = cfg.raft_store.clone();
+        raftstore_cfg.validate().unwrap();
+        let raft_store = Arc::new(VersionTrack::new(raftstore_cfg));
+        cfg_controller.register(
+            Module::Raftstore,
+            Box::new(RaftstoreConfigManager(raft_store)),
+        );
+        let config_client = ConfigHandler::start(
+            cfg.server.advertise_addr,
+            cfg_controller,
+            pd_worker.scheduler(),
+        )
+        .unwrap();
+
         node.start(
-            engines.clone(),
+            engines,
             simulate_trans.clone(),
-            snap_mgr.clone(),
+            snap_mgr,
             pd_worker,
             store_meta,
             coprocessor_host,
             importer.clone(),
-            cfg_controller,
+            split_check_worker,
+            Box::new(config_client) as _,
         )?;
         assert!(node_id == 0 || node_id == node.id());
         let node_id = node.id();
@@ -272,7 +315,7 @@ impl Simulator for ServerCluster {
                 Arc::clone(&self.pd_client),
                 resolver,
                 Arc::clone(&security_mgr),
-                &PessimisticTxnConfig::default(),
+                &pessimistic_txn_cfg,
             )
             .unwrap();
 

@@ -22,6 +22,7 @@ use tikv::storage::config::{BlockCacheConfig, Config as StorageConfig};
 use tikv_util::config::{ReadableDuration, ReadableSize};
 use tikv_util::security::SecurityConfig;
 
+mod dynamic;
 mod test_config_client;
 
 #[test]
@@ -75,6 +76,7 @@ fn test_serde_custom_tikv_config() {
         end_point_stream_batch_row_limit: 4096,
         end_point_enable_batch_if_possible: true,
         end_point_request_max_handle_duration: ReadableDuration::secs(12),
+        end_point_max_concurrency: 10,
         snap_max_write_bytes_per_sec: ReadableSize::mb(10),
         snap_max_total_size: ReadableSize::gb(10),
         stats_concurrency: 10,
@@ -85,6 +87,11 @@ fn test_serde_custom_tikv_config() {
         request_batch_wait_duration: ReadableDuration::millis(10),
     };
     value.readpool = ReadPoolConfig {
+        unify_read_pool: true,
+        unified: UnifiedReadPoolConfig {
+            min_thread_count: 5,
+            max_thread_count: 10,
+        },
         storage: StorageReadPoolConfig {
             high_concurrency: 1,
             normal_concurrency: 3,
@@ -486,12 +493,12 @@ fn test_serde_custom_tikv_config() {
             soft_pending_compaction_bytes_limit: ReadableSize::gb(12),
             hard_pending_compaction_bytes_limit: ReadableSize::gb(12),
             force_consistency_checks: false,
-            titan: titan_cf_config.clone(),
+            titan: titan_cf_config,
             prop_size_index_distance: 4000000,
             prop_keys_index_distance: 40000,
             enable_doubly_skiplist: true,
         },
-        titan: titan_db_config.clone(),
+        titan: titan_db_config,
     };
     value.storage = StorageConfig {
         data_dir: "/var".to_owned(),
@@ -500,6 +507,7 @@ fn test_serde_custom_tikv_config() {
         scheduler_concurrency: 123,
         scheduler_worker_pool_size: 1,
         scheduler_pending_write_threshold: ReadableSize::kb(123),
+        reserve_space: ReadableSize::gb(2),
         block_cache: BlockCacheConfig {
             shared: true,
             capacity: Some(ReadableSize::gb(40)),

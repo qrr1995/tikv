@@ -12,6 +12,7 @@ required-features = ["failpoints"]
 [[test]]
 name = "integrations"
 path = "integrations/mod.rs"
+required-features = ["tikv/testexport"]
 
 [[bench]]
 name = "raftstore"
@@ -42,12 +43,17 @@ name = "channel"
 path = "benches/channel/mod.rs"
 
 [features]
-failpoints = ["tikv/failpoints"]
+default = ["tikv/testexport"]
+failpoints = ["fail/failpoints", "tikv/failpoints"]
 profiling = ["profiler/profiling"]
 protobuf-codec = ["tikv/protobuf-codec", "external_storage/protobuf-codec"]
 prost-codec = ["tikv/prost-codec", "test_coprocessor/prost-codec", "external_storage/prost-codec"]
+jemalloc = ["tikv/jemalloc"]
+sse = ["tikv/sse"]
+portable = ["tikv/portable"]
 
 [dependencies]
+fail = { version = "0.3", optional = true }
 crc32fast = "1.2"
 crc64fast = "0.1"
 crossbeam = "0.7.2"

@@ -4,12 +4,11 @@ use std::io::{self, BufReader};
 use std::{fs, usize};
 
 use engine::CfName;
-use engine_rocks::{RocksSnapshot, RocksSstWriter, RocksSstWriterBuilder};
-use engine_traits::IOLimiter;
 use engine_traits::{ImportExt, IngestExternalFileOptions, KvEngine};
 use engine_traits::{Iterable, Snapshot as SnapshotTrait, SstWriter, SstWriterBuilder};
 use engine_traits::{Mutable, WriteBatch};
 use tikv_util::codec::bytes::{BytesEncoder, CompactBytesFromFileDecoder};
+use tikv_util::time::Limiter;
 
 use super::Error;
 
@@ -27,15 +26,15 @@ pub struct BuildStatistics {
 /// Build a snapshot file for the given column family in plain format.
 /// If there are no key-value pairs fetched, no files will be created at `path`,
 /// otherwise the file will be created and synchronized.
-pub fn build_plain_cf_file<S>(
+pub fn build_plain_cf_file<E>(
     path: &str,
-    snap: &S,
+    snap: &E::Snapshot,
     cf: &str,
     start_key: &[u8],
     end_key: &[u8],
 ) -> Result<BuildStatistics, Error>
 where
-    S: SnapshotTrait,
+    E: KvEngine,
 {
     let mut file = box_try!(OpenOptions::new().write(true).create_new(true).open(path));
     let mut stats = BuildStatistics::default();
@@ -60,29 +59,22 @@ where
 /// Build a snapshot file for the given column family in sst format.
 /// If there are no key-value pairs fetched, no files will be created at `path`,
 /// otherwise the file will be created and synchronized.
-pub fn build_sst_cf_file<L: IOLimiter>(
+pub fn build_sst_cf_file<E>(
     path: &str,
-    snap: &RocksSnapshot,
+    snap: &E::Snapshot,
     cf: CfName,
     start_key: &[u8],
     end_key: &[u8],
-    io_limiter: Option<&L>,
-) -> Result<BuildStatistics, Error> {
-    let mut sst_writer = create_sst_file_writer(snap, cf, path)?;
+    io_limiter: &Limiter,
+) -> Result<BuildStatistics, Error>
+where
+    E: KvEngine,
+{
+    let mut sst_writer = create_sst_file_writer::<E>(snap, cf, path)?;
     let mut stats = BuildStatistics::default();
-    let base = io_limiter
-        .as_ref()
-        .map_or(0 as i64, |l| l.get_max_bytes_per_time());
-    let mut bytes: i64 = 0;
     box_try!(snap.scan_cf(cf, start_key, end_key, false, |key, value| {
         let entry_len = key.len() + value.len();
-        if let Some(ref io_limiter) = io_limiter {
-            if bytes >= base {
-                bytes = 0;
-                io_limiter.request(base);
-            }
-            bytes += entry_len as i64
-        }
+        io_limiter.blocking_consume(entry_len);
         stats.key_count += 1;
         stats.total_size += entry_len;
         if let Err(e) = sst_writer.put(key, value) {
@@ -161,13 +153,16 @@ where
     Ok(())
 }
 
-fn create_sst_file_writer(
-    snap: &RocksSnapshot,
+fn create_sst_file_writer<E>(
+    snap: &E::Snapshot,
     cf: CfName,
     path: &str,
-) -> Result<RocksSstWriter, Error> {
+) -> Result<E::SstWriter, Error>
+where
+    E: KvEngine,
+{
     let engine = snap.get_db();
-    let builder = RocksSstWriterBuilder::new().set_db(&engine).set_cf(cf);
+    let builder = E::SstWriterBuilder::new().set_db(&engine).set_cf(cf);
     let writer = box_try!(builder.build(path));
     Ok(writer)
 }
@@ -175,14 +170,16 @@ fn create_sst_file_writer(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::f64::INFINITY;
     use std::sync::Arc;
 
     use super::*;
     use crate::raftstore::store::snap::tests::*;
     use crate::raftstore::store::snap::SNAPSHOT_CFS;
     use engine::CF_DEFAULT;
-    use engine_rocks::{Compat, RocksIOLimiter};
+    use engine_rocks::{Compat, RocksEngine, RocksSnapshot};
     use tempfile::Builder;
+    use tikv_util::time::Limiter;
 
     struct TestStaleDetector;
     impl StaleDetector for TestStaleDetector {
@@ -210,7 +207,7 @@ mod tests {
                 for cf in SNAPSHOT_CFS {
                     let snap_cf_dir = Builder::new().prefix("test-snap-cf").tempdir().unwrap();
                     let plain_file_path = snap_cf_dir.path().join("plain");
-                    let stats = build_plain_cf_file(
+                    let stats = build_plain_cf_file::<RocksEngine>(
                         &plain_file_path.to_str().unwrap(),
                         &snap,
                         cf,
@@ -270,6 +267,7 @@ mod tests {
     #[test]
     fn test_cf_build_and_apply_sst_files() {
         let db_creaters = &[open_test_empty_db, open_test_db];
+        let limiter = Limiter::new(INFINITY);
         for db_creater in db_creaters {
             for db_opt in vec![None, Some(gen_db_options_with_encryption())] {
                 let dir = Builder::new().prefix("test-snap-cf-db").tempdir().unwrap();
@@ -277,13 +275,13 @@ mod tests {
 
                 let snap_cf_dir = Builder::new().prefix("test-snap-cf").tempdir().unwrap();
                 let sst_file_path = snap_cf_dir.path().join("sst");
-                let stats = build_sst_cf_file::<RocksIOLimiter>(
+                let stats = build_sst_cf_file::<RocksEngine>(
                     &sst_file_path.to_str().unwrap(),
                     &RocksSnapshot::new(Arc::clone(&db)),
                     CF_DEFAULT,
                     b"a",
                     b"z",
-                    None,
+                    &limiter,
                 )
                 .unwrap();
                 if stats.key_count == 0 {
